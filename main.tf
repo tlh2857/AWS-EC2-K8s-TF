@@ -23,14 +23,14 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# Auto-detect latest Ubuntu 22.04 AMI if not provided
+# Auto-detect latest Ubuntu 20.04 AMI if not provided
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
 
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+    values = ["ubuntu-pro-server/images/hvm-ssd/ubuntu-focal-20.04-amd64-pro-server-20260110"]
   }
 
   filter {
