@@ -99,7 +99,7 @@ systemctl enable docker
 systemctl start docker
 
 # -------------------------------------------------------
-# 6. Install Kubernetes (kubeadm, kubelet, kubectl)
+# 6. Install Kubernetes (kubeadm, kubelet, kubectl, helm)
 # -------------------------------------------------------
 echo "=== Installing Kubernetes components ==="
 
@@ -142,6 +142,12 @@ export KUBECONFIG=/root/.kube/config
 mkdir -p /home/ubuntu/.kube
 cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
 chown ubuntu:ubuntu /home/ubuntu/.kube/config
+
+# Install Helm
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+chmod 700 get_helm.sh
+./get_helm.sh
+
 
 # -------------------------------------------------------
 # 8. Install Flannel CNI
@@ -213,64 +219,86 @@ docker tag "$ECR_REPO_NAME:$IMAGE_TAG" "$ECR_REPO:$IMAGE_TAG"
 docker push "$ECR_REPO:$IMAGE_TAG"
 
 # -------------------------------------------------------
-# 12. Create ECR pull secret in Kubernetes
+# 12. Configure ESO in Kubernetes to pull from ECR
 # -------------------------------------------------------
-echo "=== Creating ECR pull secret in Kubernetes ==="
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
 
-ECR_TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+helm install external-secrets \
+  external-secrets/external-secrets \
+  -n external-secrets \
+  --create-namespace \
+  --set installCRDs=true
 
-kubectl create secret docker-registry ecr-secret \
-    --docker-server="$ECR_URL" \
-    --docker-username=AWS \
-    --docker-password="$ECR_TOKEN" \
-    --namespace=default || true
+
+cat <<SECRETSTORE > /root/secret-store.yaml
+  apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: aws-ecr-store
+  namespace: default
+spec:
+  provider:
+    aws:
+      service: AmazonECR
+      region: $AWS_REGION
+      auth:
+        # This uses the underlying node's IAM identity
+        jwt:
+          serviceAccountRef:
+            name: default
+SECRETSTORE
+
+cat <<EXTERNALSECRET > /root/ecr-external-secret.yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: ecr-token-sync
+  namespace: default
+spec:
+  refreshInterval: "1h" # ESO will check/refresh every hour
+  secretStoreRef:
+    name: aws-ecr-store
+    kind: SecretStore
+  target:
+    name: ecr-secret # This is the name of the K8s secret created
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: "{{ .token | dockerConfigJson \"$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com\" \"AWS\" }}"
+  data:
+  - secretKey: token
+    remoteRef:
+      key: "ecr-login-token" # Special ESO keyword for ECR providers
+EXTERNALSECRET
+
+kubectl apply -f /root/secret-store.yaml
+kubectl apply -f /root/ecr-external-secret.yaml
+
+# echo "=== Creating ECR pull secret in Kubernetes ==="
+
+# ECR_TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+
+# kubectl create secret docker-registry ecr-secret \
+#     --docker-server="$ECR_URL" \
+#     --docker-username=AWS \
+#     --docker-password="$ECR_TOKEN" \
+#     --namespace=default || true
 
 # -------------------------------------------------------
 # 13. Create ECR credential refresh CronJob
 # -------------------------------------------------------
-echo "=== Setting up ECR credential refresh cron ==="
-cat <<'CRONSCRIPT' > /usr/local/bin/refresh-ecr-token.sh
-#!/bin/bash
-export KUBECONFIG=/root/.kube/config
-export AWS_REGION="${aws_region}"
-ECR_URL="${ecr_url}"
 
-ECR_TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
 
-kubectl delete secret ecr-secret --namespace=default --ignore-not-found
-kubectl create secret docker-registry ecr-secret \
-    --docker-server="$ECR_URL" \
-    --docker-username=AWS \
-    --docker-password="$ECR_TOKEN" \
-    --namespace=default
 
-# Also refresh docker login
-echo "$ECR_TOKEN" | docker login --username AWS --password-stdin "$ECR_URL"
-CRONSCRIPT
-
-chmod +x /usr/local/bin/refresh-ecr-token.sh
-
-# ECR tokens expire every 12 hours; refresh every 10 hours
-(crontab -l 2>/dev/null; echo "0 */10 * * * /usr/local/bin/refresh-ecr-token.sh >> /var/log/ecr-refresh.log 2>&1") | crontab -
 
 # -------------------------------------------------------
 # 14. Deploy Spring App using springapp.yaml (or generate)
 # -------------------------------------------------------
 echo "=== Deploying Spring Application ==="
 
-# Check if springapp.yaml exists in the repo
-if [ -f /tmp/springapp/springapp.yaml ]; then
-    echo "=== Found springapp.yaml in repo - updating image reference ==="
-    # Replace image placeholder with actual ECR image
-    sed -i "s|image:.*|image: $ECR_REPO:$IMAGE_TAG|g" /tmp/springapp/springapp.yaml
-    # Add imagePullSecrets if not present
-    if ! grep -q "imagePullSecrets" /tmp/springapp/springapp.yaml; then
-        sed -i '/containers:/i\      imagePullSecrets:\n      - name: ecr-secret' /tmp/springapp/springapp.yaml
-    fi
-    cp /tmp/springapp/springapp.yaml /root/springapp.yaml
-else
-    echo "=== springapp.yaml not found in repo - generating deployment manifest ==="
-    cat <<APPYAML > /root/springapp.yaml
+
+cat <<APPYAML > /root/springapp.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -301,7 +329,6 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
-
 ---
 apiVersion: v1
 kind: Service
@@ -317,7 +344,7 @@ spec:
     targetPort: 8080
     nodePort: 30080
 APPYAML
-fi
+
 
 kubectl apply -f /root/springapp.yaml
 
