@@ -301,18 +301,7 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
-        readinessProbe:
-          httpGet:
-            path: /actuator/health
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        livenessProbe:
-          httpGet:
-            path: /actuator/health
-            port: 8080
-          initialDelaySeconds: 60
-          periodSeconds: 15
+
 ---
 apiVersion: v1
 kind: Service
