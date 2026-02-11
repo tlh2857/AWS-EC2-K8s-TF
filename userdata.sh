@@ -232,7 +232,7 @@ helm install external-secrets \
 
 
 cat <<SECRETSTORE > /root/secret-store.yaml
-  apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1beta1
 kind: SecretStore
 metadata:
   name: aws-ecr-store
@@ -288,7 +288,7 @@ kubectl apply -f /root/ecr-external-secret.yaml
 # -------------------------------------------------------
 # 13. Create ECR credential refresh CronJob
 # -------------------------------------------------------
-
+sudo apt install amazon-ecr-credential-helper -y
 
 
 
