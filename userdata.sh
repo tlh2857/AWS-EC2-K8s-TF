@@ -176,6 +176,44 @@ done
 
 kubectl get nodes -o wide
 
+
+# 9.1 Ensure the ECR refresh script is created on the host
+cat <<'EOF' > /usr/local/bin/refresh-ecr-token.sh
+#!/bin/bash
+# ECR tokens expire every 12 hours; this script refreshes them for K8s and Docker
+export KUBECONFIG=/root/.kube/config
+export AWS_REGION="${aws_region}"
+ECR_URL="${ecr_url}"
+
+# Fetch new token
+ECR_TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+
+# Update Kubernetes Secret (using apply to be idempotent)
+kubectl create secret docker-registry ecr-secret \
+    --docker-server="$ECR_URL" \
+    --docker-username=AWS \
+    --docker-password="$ECR_TOKEN" \
+    --namespace=default \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+# Update local Docker login for the root user
+echo "$ECR_TOKEN" | docker login --username AWS --password-stdin "$ECR_URL"
+EOF
+
+chmod +x /usr/local/bin/refresh-ecr-token.sh
+
+# 9.2 Add the cron job (Scheduled for every 10 hours)
+# This check ensures the line isn't added multiple times if the userdata runs again
+NEW_JOB="0 */10 * * * /usr/local/bin/refresh-ecr-token.sh >> /var/log/ecr-refresh.log 2>&1"
+(crontab -l 2>/dev/null | grep -Fq "$NEW_JOB") || (crontab -l 2>/dev/null; echo "$NEW_JOB") | crontab -
+
+# 9.3 Run it once immediately to ensure the initial secret is created
+# Note: This should happen AFTER 'kubeadm init' or 'kubeadm join' is complete
+/usr/local/bin/refresh-ecr-token.sh
+
+
+
+
 # -------------------------------------------------------
 # 10. Authenticate to ECR
 # -------------------------------------------------------
@@ -219,80 +257,6 @@ docker tag "$ECR_REPO_NAME:$IMAGE_TAG" "$ECR_REPO:$IMAGE_TAG"
 docker push "$ECR_REPO:$IMAGE_TAG"
 
 # -------------------------------------------------------
-# 12. Configure ESO in Kubernetes to pull from ECR
-# -------------------------------------------------------
-helm repo add external-secrets https://charts.external-secrets.io
-helm repo update
-
-helm install external-secrets \
-  external-secrets/external-secrets \
-  -n external-secrets \
-  --create-namespace \
-  --set installCRDs=true
-
-
-cat <<SECRETSTORE > /root/secret-store.yaml
-apiVersion: external-secrets.io/v1beta1
-kind: SecretStore
-metadata:
-  name: aws-ecr-store
-  namespace: default
-spec:
-  provider:
-    aws:
-      service: AmazonECR
-      region: $AWS_REGION
-      auth:
-        # This uses the underlying node's IAM identity
-        jwt:
-          serviceAccountRef:
-            name: default
-SECRETSTORE
-
-cat <<EXTERNALSECRET > /root/ecr-external-secret.yaml
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata:
-  name: ecr-token-sync
-  namespace: default
-spec:
-  refreshInterval: "1h" # ESO will check/refresh every hour
-  secretStoreRef:
-    name: aws-ecr-store
-    kind: SecretStore
-  target:
-    name: ecr-secret # This is the name of the K8s secret created
-    template:
-      type: kubernetes.io/dockerconfigjson
-      data:
-        .dockerconfigjson: "{{ .token | dockerConfigJson \"$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com\" \"AWS\" }}"
-  data:
-  - secretKey: token
-    remoteRef:
-      key: "ecr-login-token" # Special ESO keyword for ECR providers
-EXTERNALSECRET
-
-kubectl apply -f /root/secret-store.yaml
-kubectl apply -f /root/ecr-external-secret.yaml
-
-# echo "=== Creating ECR pull secret in Kubernetes ==="
-
-# ECR_TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
-
-# kubectl create secret docker-registry ecr-secret \
-#     --docker-server="$ECR_URL" \
-#     --docker-username=AWS \
-#     --docker-password="$ECR_TOKEN" \
-#     --namespace=default || true
-
-# -------------------------------------------------------
-# 13. Create ECR credential refresh CronJob
-# -------------------------------------------------------
-sudo apt install amazon-ecr-credential-helper -y
-
-
-
-# -------------------------------------------------------
 # 14. Deploy Spring App using springapp.yaml (or generate)
 # -------------------------------------------------------
 echo "=== Deploying Spring Application ==="
@@ -315,8 +279,8 @@ spec:
       labels:
         app: springapp
     spec:
-      imagePullSecrets:
-      - name: ecr-secret
+      # imagePullSecrets:
+      # - name: ecr-secret
       containers:
       - name: springapp
         image: $ECR_REPO:$IMAGE_TAG
